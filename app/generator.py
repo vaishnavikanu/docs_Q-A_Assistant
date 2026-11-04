@@ -109,32 +109,35 @@ def generate_grounded_answer(
         response_schema=GroundedAnswerPayload,
     )
 
-    # First attempt
-    for attempt in range(2):
+    # Candidate models in priority order (starting with user's configured model)
+    primary_model = settings.GEMINI_GENERATION_MODEL
+    candidate_models = [primary_model]
+    for alt in ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]:
+        if alt not in candidate_models:
+            candidate_models.append(alt)
+
+    for model_name in candidate_models:
         try:
-            logger.info(f"Calling Gemini {settings.GEMINI_GENERATION_MODEL} (attempt {attempt + 1})...")
+            logger.info(f"Generating grounded answer using Gemini model '{model_name}'...")
             response = client.models.generate_content(
-                model=settings.GEMINI_GENERATION_MODEL,
+                model=model_name,
                 contents=prompt,
                 config=config,
             )
 
             raw_text = response.text
             if not raw_text:
-                raise ValueError("Empty response text from Gemini.")
+                continue
 
             parsed = json.loads(raw_text)
             return GroundedAnswerPayload(**parsed)
         except Exception as e:
-            logger.warning(f"Generation attempt {attempt + 1} failed: {e}")
-            if attempt == 1:
-                # Fallback after retry
-                return GroundedAnswerPayload(
-                    status="not_covered",
-                    answer=settings.FALLBACK_ANSWER,
-                    cited_chunk_ids=[],
-                    supporting_quotes=[]
-                )
+            err_msg = str(e)
+            logger.warning(f"Generation with model '{model_name}' failed: {err_msg}")
+            # If model is 404 (sunset) or 503 (high demand), try next candidate
+            if "404" in err_msg or "503" in err_msg or "UNAVAILABLE" in err_msg:
+                continue
+            # For other errors, try next model
 
     return GroundedAnswerPayload(
         status="not_covered",
