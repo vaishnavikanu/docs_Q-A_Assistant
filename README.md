@@ -7,72 +7,149 @@ An enterprise documentation Q&A system built for Solstice Learning support teams
 
 ---
 
-## 1. System Architecture & Flow
+## 1. Public Deployment & Access
+
+The application is deployed on **AWS EC2** in the **Sydney (`ap-southeast-2`)** region and is publicly accessible:
+
+* **Live Application URL**: [http://3.26.216.51](http://3.26.216.51)
+* **Access Protocol**: HTTP on Port 80 (served via Nginx reverse proxy)
+* **Instance Type**: AWS EC2 `t3.small` (2 vCPUs, 2 GB RAM, 8 GB gp3 root volume + 1.5 GB swapfile)
+* **Operating System**: Ubuntu Server 24.04 LTS
+
+> [!IMPORTANT]
+> **EC2 Instance State Note**: To optimize cloud hosting costs, the EC2 instance may be stopped when not in active use or during demonstration evaluation intervals. If the live link does not immediately respond, the instance needs to be started from the AWS EC2 Console before accessing the web portal.
+
+---
+
+## 2. System & Deployment Architecture
+
+### End-to-End Production Deployment Flow
 
 ```
-[ Streamlit Web Portal ] (Port 8501)       [ Evaluation Suite (eval.py) ]
-           │                                             │
-           └─────────────────────┬───────────────────────┘
-                                 │ HTTP / REST
-                                 ▼
-                     [ FastAPI Server ] (Port 8000)
-                                 │
-                 ┌───────────────┴───────────────┐
-                 ▼                               ▼
-       [ SQLAlchemy ORM ]               [ Qdrant In-Memory ]
-       [ SQLite: documents,       ]     [ + Gemini Embeds  ]
-       [ question_log             ]              │
-                 │                               │
-                 └───────────────┬───────────────┘
-                                 ▼
-                        [ DocsQA Engine ]
-                                 │
-                 ┌───────────────┼──────────────────┐
-                 ▼               ▼                  ▼
-             [ BM25 ]    [ Semantic Search ]    [ Corpus     ]
-             [ Search ]  [ (Qdrant)        ]    [ Vocabulary ]
-                 │               │                  │
-                 └───────┬───────┘                  │
-                         ▼                          │
-               [ RRF Fusion (top-3) ]               │
-                         │                          │
-                         ▼                          │
-                [ Evidence Gate ] ◄─────────────────┘
-            (score floor + unknown-term signal)
-                         │ pass                 fail ──► "I don't have an answer for that."
-                         ▼
-          [ Grounded Gemini Answer (JSON) ]
-                         │
-                         ▼
-        [ Verifier: Chunks, Quotes, Numbers & Units ] ── fail ──► "I don't have an answer for that."
-                         │ pass
-                         ▼
-             [ Verified Answer + Citations ] ──► Logged to question_log
+                      Public Internet / User Browser
+                                    │
+                                    ▼ HTTP (Port 80)
+                       [ Nginx Reverse Proxy ]
+                       (Listens on 0.0.0.0:80)
+                                    │
+                      proxy_pass    ▼ (127.0.0.1:8501 - Loopback)
+                 [ Streamlit Frontend Portal ]
+                 (Managed by solstice-frontend.service)
+                                    │
+                         Internal Python requests
+                       (API_URL=http://127.0.0.1:8000)
+                                    │
+                                    ▼ (127.0.0.1:8000 - Loopback)
+                     [ FastAPI Backend (Uvicorn) ]
+                     (Managed by solstice-backend.service)
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+[ SQLite Database ]        [ Qdrant In-Memory ]        [ Google Gemini API ]
+(solstice_docs.db)         (Dense Vector Index)        - gemini-embedding-001
+- documents table          - 3072-dim embeddings       - gemini-3.5-flash-lite
+- question_log table       - Cosine similarity         - Grounded JSON schema
+```
+
+### Network Security & Port Isolation
+
+| Port | Service | Scope | Security Policy |
+| :---: | :---: | :---: | :--- |
+| **80** | Nginx Reverse Proxy | **Public** | Inbound allowed (`0.0.0.0/0`) in AWS Security Group. Proxies to Streamlit. |
+| **22** | OpenSSH | **Administrative** | Inbound allowed for remote server administration via SSH. |
+| **8501** | Streamlit Frontend | **Internal Only** | Bound strictly to `127.0.0.1:8501`. Blocked from external internet access. |
+| **8000** | FastAPI Backend | **Internal Only** | Bound strictly to `127.0.0.1:8000`. Blocked from external internet access. |
+
+---
+
+## 3. Background Process Management (systemd)
+
+On the EC2 instance, both application tiers run as isolated background daemon services managed by Ubuntu's `systemd` init system. This ensures automatic restarts upon failure, proper environment variable injection, and automated boot-up with the server.
+
+### Systemd Service Configurations
+
+1. **FastAPI Backend Service** (`/etc/systemd/system/solstice-backend.service`):
+   ```ini
+   [Unit]
+   Description=Solstice Docs QA - FastAPI Backend (Internal)
+   After=network.target
+
+   [Service]
+   User=ubuntu
+   WorkingDirectory=/home/ubuntu/docs_Q-A_Assistant
+   EnvironmentFile=/home/ubuntu/docs_Q-A_Assistant/.env
+   ExecStart=/home/ubuntu/docs_Q-A_Assistant/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+2. **Streamlit Frontend Service** (`/etc/systemd/system/solstice-frontend.service`):
+   ```ini
+   [Unit]
+   Description=Solstice Docs QA - Streamlit Frontend (Internal)
+   After=network.target solstice-backend.service
+
+   [Service]
+   User=ubuntu
+   WorkingDirectory=/home/ubuntu/docs_Q-A_Assistant
+   EnvironmentFile=/home/ubuntu/docs_Q-A_Assistant/.env
+   Environment="API_URL=http://127.0.0.1:8000"
+   ExecStart=/home/ubuntu/docs_Q-A_Assistant/venv/bin/streamlit run frontend/streamlit_app.py --server.port 8501 --server.address 127.0.0.1 --server.headless true
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+### Service Management Commands
+
+```bash
+# Check service health and status
+sudo systemctl status solstice-backend
+sudo systemctl status solstice-frontend
+
+# Restart services
+sudo systemctl restart solstice-backend solstice-frontend
+
+# Stop services
+sudo systemctl stop solstice-backend solstice-frontend
+
+# Start services
+sudo systemctl start solstice-backend solstice-frontend
+
+# View live real-time service logs
+sudo journalctl -u solstice-backend -f
+sudo journalctl -u solstice-frontend -f
 ```
 
 ---
 
-## 2. Key Capabilities & Architectural Safeguards
+## 4. Key Architectural Safeguards & Features
 
 1. **Sentence-Aware Chunking (~400 chars)**:
-   - Cuts strictly at punctuation boundaries (`.!?`) to keep atomic facts intact (e.g. *"Growth plans are limited to 60 requests per minute"*).
+   - Cuts strictly at sentence boundaries (`.!?`) to keep atomic facts intact (e.g. *"Growth plans are limited to 60 requests per minute"*).
    - Retains the remainder so no documentation content or short articles (`D-02`, `D-05`) are lost.
    - Seed documents produce exactly **10 chunks** with preserved metadata (`doc_id`, `title`, `chunk_id`, `text`).
 
 2. **Hybrid Retrieval with Reciprocal Rank Fusion (RRF)**:
    - **Lexical**: Okapi BM25 (`rank-bm25`) captures exact keyword matches (`Growth plan`, `CSV`, `10,000 rows`).
-   - **Dense Semantic**: Gemini Embeddings (`gemini-embedding-001`) stored in an in-memory **Qdrant** collection for cosine similarity search.
-   - **Rank-Based Fusion**: $RRF(c) = \frac{1}{60 + \text{rank}_{BM25}} + \frac{1}{60 + \text{rank}_{semantic}}$ combines rankings without scale mismatch.
-   - **Graceful Degradation**: If Gemini API is unreachable or key is not configured, the engine switches to BM25-only keyword mode and clearly flags the degraded status.
+   - **Dense Semantic**: Gemini Embeddings (`gemini-embedding-001`, 3072 dimensions) stored in an in-memory **Qdrant** collection for cosine similarity search.
+   - **Rank-Based Fusion**: $RRF(c) = \frac{1}{60 + \text{rank}_{BM25}} + \frac{1}{60 + \text{rank}_{semantic}}$ merges rankings without scale mismatch.
+   - **Graceful Degradation**: If the Gemini API is unreachable or the key is omitted, the engine switches to BM25-only keyword mode and clearly reports the degraded status.
 
 3. **Layer 1: Evidence Gate**:
    - Score floors (`BM25 >= 0.05`, `Cosine >= 0.40`). Questions failing the score floor trigger immediate abstention without calling the LLM.
-   - Rule-based detection identifies candidate product/brand/integration names in the query that do not exist in the documentation corpus (e.g., *Salesforce*, *HubSpot*, *PDF*).
+   - Rule-based detection identifies candidate product/brand/integration names in the query that do not exist in the documentation corpus (e.g. *Salesforce*, *HubSpot*, *PDF*).
 
-4. **Layer 2: Grounded Synthesis (Gemini 2.5 Flash)**:
+4. **Layer 2: Grounded Synthesis (Gemini API)**:
    - Prompt provides *only* the top-3 retrieved passages.
    - Strict system instruction: answer exclusively from the provided excerpts; if not explicitly stated, return status `not_covered`.
    - Structured JSON schema enforcing status, answer text, cited chunk IDs, and verbatim supporting sentences.
+   - Resilient model fallback: prioritizes active Gemini Flash models (`gemini-3.5-flash-lite`, `gemini-3.8-flash`) to handle Google API model lifecycle transitions.
 
 5. **Layer 3: Python Deterministic Verification**:
    - Rejects answers citing chunks that were not retrieved.
@@ -88,20 +165,22 @@ An enterprise documentation Q&A system built for Solstice Learning support teams
 
 ---
 
-## 3. Technology Stack
+## 5. Technology Stack
 
-- **Language**: Python 3.11 / 3.12 / 3.13
+- **Cloud Infrastructure**: AWS EC2 (`t3.small`), Ubuntu 24.04 LTS, Nginx Reverse Proxy
+- **Language & Runtime**: Python 3.12 / 3.13
 - **Web API**: FastAPI, Uvicorn, Pydantic v2
 - **Admin UI**: Streamlit
 - **Database & ORM**: SQLite, SQLAlchemy 2.x
 - **Vector Database**: Qdrant Client (In-Memory mode)
 - **Keyword Search**: rank-bm25 (BM25Okapi)
-- **LLM & Embeddings**: Google GenAI SDK (`gemini-2.5-flash`, `gemini-embedding-001`)
+- **LLM & Embeddings**: Google GenAI SDK (`gemini-3.5-flash-lite` / `gemini-3.8-flash`, `gemini-embedding-001`)
+- **Process Management**: systemd
 - **Testing**: Pytest, HTTPX
 
 ---
 
-## 4. Repository Structure
+## 6. Repository Structure
 
 ```
 ├── app/
@@ -142,7 +221,7 @@ An enterprise documentation Q&A system built for Solstice Learning support teams
 
 ---
 
-## 5. Setup & Installation
+## 7. Local Setup & Execution Instructions
 
 ### Step 1: Clone and Set Up Virtual Environment
 
@@ -150,7 +229,7 @@ An enterprise documentation Q&A system built for Solstice Learning support teams
 git clone https://github.com/vaishnavikanu/docs_Q-A_Assistant.git
 cd docs_Q-A_Assistant
 
-python -m venv venv
+python3 -m venv venv
 # On Windows:
 venv\Scripts\activate
 # On Linux/macOS:
@@ -160,60 +239,99 @@ source venv/bin/activate
 ### Step 2: Install Dependencies
 
 ```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
 ### Step 3: Configure Environment Variables
 
-Create a `.env` file from `.env.example`:
+Create a local `.env` file from `.env.example`:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and add your Gemini API key:
+Populate `.env` with your configuration:
 
 ```ini
 GEMINI_API_KEY=your_actual_gemini_api_key_here
 GEMINI_EMBEDDING_MODEL=gemini-embedding-001
-GEMINI_GENERATION_MODEL=gemini-2.5-flash
+GEMINI_GENERATION_MODEL=gemini-3.5-flash-lite
 DATABASE_URL=sqlite:///./solstice_docs.db
 CHUNK_SIZE=400
 RRF_K=60
 TOP_K_CHUNKS=3
 BM25_SCORE_FLOOR=0.05
 COSINE_SCORE_FLOOR=0.40
+API_URL=http://127.0.0.1:8000
 ```
 
-> **Note**: If `GEMINI_API_KEY` is not provided, the system runs safely in **BM25-only degraded mode** and never crashes or fabricates answers.
+> [!NOTE]
+> `.env` is ignored by `.gitignore`. Secret keys must never be committed to source control.
+
+### Step 4: Run Locally
+
+* **Start Backend**:
+  ```bash
+  uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+  ```
+* **Start Admin Portal**:
+  ```bash
+  streamlit run frontend/streamlit_app.py
+  ```
 
 ---
 
-## 6. Running the Application
+## 8. Evaluation & Verification Results
 
-### Start the FastAPI Backend
+### Automated Unit Test Suite (`pytest tests/`)
+```text
+============================= test session starts =============================
+platform win32 / linux -- Python 3.12/3.13, pytest-9.2.0, pluggy-1.7.0
+collected 25 items
 
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+tests/test_api.py ......                                                 [ 24%]
+tests/test_chunking.py ....                                              [ 40%]
+tests/test_database.py ...                                               [ 52%]
+tests/test_evidence_gate.py .....                                        [ 72%]
+tests/test_verifier.py .......                                           [100%]
+
+======================== 25 passed in 2.14s ========================
 ```
 
-- Interactive Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
-- System Health: [http://localhost:8000/health](http://localhost:8000/health)
-
-### Start the Streamlit Admin Web Portal
-
-In a separate terminal (with virtual environment activated):
-
-```bash
-streamlit run frontend/streamlit_app.py
+### Official Evaluation Suite (`python scripts/eval.py --local`)
+```text
+================================================================================
+Running Solstice Docs Q&A Assistant Evaluation in LOCAL ENGINE mode
+================================================================================
+Retrieval Mode: HYBRID
+Chunks Count: 10
+Gemini API Configured: True
+--------------------------------------------------------------------------------
+[PASS] Q-1: 'How do I reset my password?'
+         Result: Doc: D-01 (expected D-01) | Answer: To reset your password, click 'Forgot password?' on the login screen...
+[PASS] Q-2: 'How long do I have to use a password reset link before it expires?'
+         Result: Doc: D-01 (expected D-01) | Answer: Password reset links expire after 15 minutes.
+[PASS] Q-3: 'What's the maximum number of rows I can export to CSV?'
+         Result: Doc: D-03 (expected D-03) | Answer: CSV exports are limited to a maximum of 10,000 rows.
+[PASS] Q-4: 'What are the API rate limits for the Growth plan?'
+         Result: Doc: D-06 (expected D-06) | Answer: For Growth plans, the API rate limit is 60 requests per minute...
+[PASS] Q-5: 'Can I connect Solstice to Salesforce?'
+         Result: Abstained correctly with: 'I don't have an answer for that.'
+[PASS] EDGE-1 (Paraphrased Q-2): 'When does the password reset link expire?'
+         Result: Doc: D-01 (expected D-01) | Answer: Password reset links expire after 15 minutes.
+[PASS] EDGE-2 (Unknown Integration): 'Can I integrate with HubSpot CRM?'
+         Result: Abstained correctly with: 'I don't have an answer for that.'
+[PASS] EDGE-3 (Off-topic question): 'What is the capital of Australia?'
+         Result: Abstained correctly with: 'I don't have an answer for that.'
+================================================================================
+Evaluation Summary: 8/8 tests passed (100.0%)
+================================================================================
 ```
-
-- Portal URL: [http://localhost:8501](http://localhost:8501)
-- Includes benchmark question quick-fill buttons, source citation display, verbatim quote callouts, retrieval score inspection, and knowledge base document management.
 
 ---
 
-## 7. API Endpoints
+## 9. API Endpoints
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
@@ -229,47 +347,7 @@ streamlit run frontend/streamlit_app.py
 
 ---
 
-## 8. Evaluation & Verification
-
-### Run Automated Unit & Integration Tests
-
-```bash
-pytest tests/
-```
-
-Test coverage includes:
-- `tests/test_database.py`: SQLite initialization, auto-seeding, document CRUD, and question logging.
-- `tests/test_chunking.py`: Sentence boundary checks, remainder preservation, and fact retention across all 6 documents.
-- `tests/test_evidence_gate.py`: Score floor enforcement, unknown-term detection (Salesforce, HubSpot, PDF).
-- `tests/test_verifier.py`: Cited chunk checks, verbatim quote checks, numerical and unit verification ("15 hours" vs "15 minutes", "60 requests per second" vs "per minute").
-- `tests/test_api.py`: FastAPI endpoints, validation, Swagger compatibility, and CRUD re-indexing.
-
-### Run Benchmark Evaluation Script
-
-```bash
-# Evaluate against running backend:
-python scripts/eval.py --api-url http://127.0.0.1:8000
-
-# Or evaluate directly against local engine:
-python scripts/eval.py --local
-```
-
-### Official Evaluation Results
-
-| ID | Question | Expected Doc | Expected Outcome | Result |
-| :--- | :--- | :--- | :--- | :--- |
-| **Q-1** | How do I reset my password? | `D-01` | Password reset steps & requirements | **PASS** |
-| **Q-2** | How long do I have to use a password reset link before it expires? | `D-01` | "15 minutes" | **PASS** |
-| **Q-3** | What's the maximum number of rows I can export to CSV? | `D-03` | "10,000 rows" | **PASS** |
-| **Q-4** | What are the API rate limits for the Growth plan? | `D-06` | "60 requests per minute" | **PASS** |
-| **Q-5** | Can I connect Solstice to Salesforce? | *null* | Strict refusal: *"I don't have an answer for that."* | **PASS** |
-| **EDGE-1** | When does the password reset link expire? (Paraphrase) | `D-01` | "15 minutes" | **PASS** |
-| **EDGE-2** | Can I integrate with HubSpot CRM? (Unknown integration) | *null* | Refusal: *"I don't have an answer for that."* | **PASS** |
-| **EDGE-3** | What is the capital of Australia? (Off-topic) | *null* | Refusal: *"I don't have an answer for that."* | **PASS** |
-
----
-
-## 9. Known Limitations & Roadmap for v2
+## 10. Known Limitations & Roadmap for v2
 
 1. **Authentication & RBAC**: In v1, support admin CRUD operations are unauthenticated. v2 will integrate OAuth2/JWT and role-based permissions (Viewer, Editor, Admin).
 2. **Conversational Memory**: v1 focuses on independent factual queries. v2 will support multi-turn query resolution while maintaining strict grounding.

@@ -38,7 +38,7 @@ The goal is to build a reliable, maintainable Q&A system that accurately retriev
   - **Unknown-term signal**: product- or brand-like terms in the question that appear nowhere in the documentation (e.g. "Salesforce", "HubSpot", "PDF") are flagged. They are not rejected on the spot; the signal is carried forward and enforced in Layers 2 and 3.
   - A lightweight rule-based detector identifies candidate product, brand and integration names in the question and compares them against the documentation vocabulary. Matching terms are ignored; unfamiliar candidates are flagged for downstream verification. This heuristic is intentionally limited and may occasionally flag harmless words.
 - **Grounded Answer Generation (Layer 2)**:
-  - Gemini (`gemini-2.5-flash`, temperature 0, JSON schema output) receives only the retrieved passages.
+  - Gemini (`gemini-3.5-flash-lite` / `gemini-3.8-flash`, temperature 0, JSON schema output) receives only the retrieved passages.
   - It is told explicitly which flagged terms the docs never mention, and must return `not_covered` if the answer depends on them.
   - It returns a status (`answered` / `not_covered` / `needs_clarification`), the answer, chunk IDs and verbatim supporting quotes.
 - **Deterministic Verification (Layer 3)**: Code checks that:
@@ -48,17 +48,18 @@ The goal is to build a reliable, maintainable Q&A system that accurately retriev
   - the verifier rejects any answer that mentions a flagged unknown term.
 
   Any failure returns `"I don't have an answer for that."`.
-- **Client Interfaces**:
+- **Client Interfaces & Production Hosting**:
   - FastAPI backend exposing `POST /ask`, `GET /health`, `GET /unanswered` and `/documents` CRUD, with interactive Swagger docs (`/docs`).
   - Streamlit web portal for admin Q&A, showing answers, quoted sources, example questions and a retrieval-details panel.
+  - Production deployment on AWS EC2 (`t3.small`, Ubuntu 24.04 LTS) in Sydney (`ap-southeast-2`) using Nginx on port 80 and isolated systemd background daemons.
   - Evaluation script (`scripts/eval.py`) that runs the benchmark questions against the API.
 
 ### Explicitly Excluded from v1
 - User authentication and role-based permissions (RBAC).
 - Multi-turn conversational chat memory (admins ask independent factual questions).
 - Live ticketing sync (Zendesk / Jira ticket generation).
-- Distributed vector databases and multiple LLM providers.
-- Cloud deployment: v1 runs locally.
+- Distributed vector databases and multiple external LLM providers.
+- Complex Kubernetes/container orchestration (v1 uses native Linux systemd services and Nginx).
 
 ### Assumptions
 - The 6 articles in `docs.json` are the initial knowledge base, seeded into SQLite on first boot. The 5 questions in `example_questions.json` are the primary evaluation set.
@@ -71,7 +72,7 @@ The goal is to build a reliable, maintainable Q&A system that accurately retriev
 
 ## 3. System Architecture
 
-The project uses a decoupled client-server structure:
+### Internal Component Pipeline
 
 ```
 [ Streamlit Web Portal ] (8501)       [ Eval Script (eval.py) ]
@@ -135,7 +136,56 @@ The project uses a decoupled client-server structure:
 
 ---
 
-## 4. Key Trade-offs & Decisions
+## 4. Production AWS EC2 Deployment Architecture
+
+The application is deployed on an **AWS EC2 `t3.small`** instance running **Ubuntu Server 24.04 LTS** in the **Sydney (`ap-southeast-2`)** region:
+
+```
+                      Public Internet / User Browser
+                                    │
+                                    ▼ HTTP (Port 80)
+                       [ Nginx Reverse Proxy ]
+                       (Listens on 0.0.0.0:80)
+                                    │
+                      proxy_pass    ▼ (127.0.0.1:8501 - Loopback)
+                 [ Streamlit Frontend Portal ]
+                 (Managed by solstice-frontend.service)
+                                    │
+                         Internal Python requests
+                       (API_URL=http://127.0.0.1:8000)
+                                    │
+                                    ▼ (127.0.0.1:8000 - Loopback)
+                     [ FastAPI Backend (Uvicorn) ]
+                     (Managed by solstice-backend.service)
+                                    │
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+[ SQLite Database ]        [ Qdrant In-Memory ]        [ Google Gemini API ]
+(solstice_docs.db)         (Dense Vector Index)        - gemini-embedding-001
+- documents table          - 3072-dim embeddings       - gemini-3.5-flash-lite
+- question_log table       - Cosine similarity         - Grounded JSON schema
+```
+
+### Production Access & Networking
+- **Public URL**: `http://3.26.216.51` (Port 80 HTTP via Nginx)
+- **Port Security**:
+  - Only **Port 80** (HTTP) and **Port 22** (SSH) are open in the AWS Security Group.
+  - Ports **8000** (FastAPI) and **8501** (Streamlit) are bound strictly to `127.0.0.1` (loopback only) and are not directly reachable from the public internet.
+- **Reverse Proxy**: Nginx proxies incoming Port 80 traffic to Streamlit (`127.0.0.1:8501`) with WebSocket upgrade support (`Upgrade $http_upgrade`, `Connection "upgrade"`).
+- **Process Management**:
+  - `solstice-backend.service`: Runs `uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1` under systemd with automatic restart on failure.
+  - `solstice-frontend.service`: Runs `streamlit run frontend/streamlit_app.py --server.port 8501 --server.address 127.0.0.1 --server.headless true` under systemd with automatic restart on failure.
+- **Service Management Commands**:
+  - `sudo systemctl status solstice-backend solstice-frontend` (check health)
+  - `sudo systemctl restart solstice-backend solstice-frontend` (restart both tiers)
+  - `sudo systemctl stop solstice-backend solstice-frontend` (stop services)
+  - `sudo systemctl start solstice-backend solstice-frontend` (start services)
+  - `sudo journalctl -u solstice-backend -f` (view live backend logs)
+- **Instance State & Cost Note**: The EC2 instance may be stopped when not in active use to minimize cloud hosting costs. When stopped, it must be restarted from the AWS Console before accessing the web interface.
+
+---
+
+## 5. Key Trade-offs & Decisions
 
 | Decision | What We Chose | What We Skipped | Why |
 | :--- | :--- | :--- | :--- |
@@ -147,11 +197,11 @@ The project uses a decoupled client-server structure:
 | **Unknown Terms** | Signal, enforced by the LLM prompt and the verifier | Hard rejection on any unfamiliar term | A hard rejection over-abstains on harmless extras ("reset my password on my iPhone"). Flagging unfamiliar terms instead of immediately rejecting the question avoids unnecessary abstentions. However, to maintain safety, the verifier rejects any generated answer that mentions a flagged unknown term. This is a conservative approach that may occasionally reject otherwise valid answers. |
 | **Abstention Logic** | Score floor + LLM answerability + code verification | Score threshold alone; prompt-only guardrail | Similarity scores are high even for on-topic questions the docs don't answer ("Salesforce" resembles the API doc), and prompts alone can't be enforced. Code checks can. |
 | **Answer Format** | Grounded LLM answer with verified quotes | Pure sentence extraction; unverified LLM generation | Extraction can return the wrong sentence and breaks multi-step answers (Q-1). Unverified generation can invent details. Verified quotes make every answer traceable. |
-| **Client UI** | Streamlit + FastAPI | Single-page static HTML; React | An interactive portal in pure Python; FastAPI adds input validation and Swagger docs for the demo. |
+| **Client UI & Hosting** | Streamlit + FastAPI on AWS EC2 (`t3.small`) via Nginx | Single-page static HTML; Kubernetes | Lightweight pure-Python interface with Swagger documentation; Nginx on port 80 provides a single secure public entry point with loopback process isolation. |
 
 ---
 
-## 5. Evaluation & Verification
+## 6. Evaluation & Verification
 
 The implementation is verified against the 5 questions in `starter_kit/data/example_questions.json`:
 
@@ -170,5 +220,3 @@ The implementation is verified against the 5 questions in `starter_kit/data/exam
 5. `Q-5`: *"Can I connect Solstice to Salesforce?"*
    - Target: `null` (Unsupported)
    - Expected: Rejection with exact text `"I don't have an answer for that."`. "Salesforce" is flagged by the unknown-term signal, Gemini returns `not_covered`, and the verifier blocks any answer that mentions it.
-
-
